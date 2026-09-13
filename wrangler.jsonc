@@ -20,7 +20,7 @@
 	"kv_namespaces": [
 		{
 			"binding": "VINEXT_KV_CACHE",
-			"id": "<your-kv-namespace-id>"
+			"id": "3d0249187f984ebfb53691d0ff730a9c"
 		}
 	],
 	"d1_databases": [
@@ -32,10 +32,18 @@
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "SESSION", "class_name": "LectureSession" }
+			{
+				"name": "SESSION",
+				"class_name": "LectureSession"
+			}
 		]
 	},
 	"migrations": [
-		{ "tag": "v1", "new_sqlite_classes": ["LectureSession"] }
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"LectureSession"
+			]
+		}
 	]
 }

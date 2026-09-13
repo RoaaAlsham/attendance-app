@@ -15,19 +15,38 @@ export async function middleware(req: NextRequest) {
   headers.set("x-user-id", identity.userId);
   headers.set("x-user-role", identity.role);
 
-  if (isLecturerOnly(req) && identity.role !== "lecturer") {
-    return new NextResponse(null, { status: 403 });
-  }
-  if (isStudentOnly(req) && identity.role !== "student") {
-    return new NextResponse(null, { status: 403 });
+  if (
+    (isLecturerOnly(req) && identity.role !== "lecturer") ||
+    (isStudentOnly(req) && identity.role !== "student")
+  ) {
+    return forbidden(req);
   }
   return NextResponse.next({ request: { headers } });
 }
 
-function unauthorized(req: NextRequest) {
+async function unauthorized(req: NextRequest) {
+  await drainBody(req);
   return req.nextUrl.pathname.startsWith("/api/")
     ? new NextResponse(null, { status: 401 })
     : NextResponse.redirect(new URL("/login", req.url));
+}
+
+async function forbidden(req: NextRequest) {
+  await drainBody(req);
+  return new NextResponse(null, { status: 403 });
+}
+
+/**
+ * Rejecting a request without reading its body leaves unread bytes on a
+ * keep-alive connection, which breaks the *next* request that reuses it.
+ * Only safe on paths that never reach a route handler.
+ */
+async function drainBody(req: NextRequest) {
+  try {
+    await req.arrayBuffer();
+  } catch {
+    // no body to drain
+  }
 }
 
 function isLecturerOnly(req: NextRequest) {

@@ -6,15 +6,19 @@ function toHex(bytes: Uint8Array): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
+function fromHex(hex: string): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(new ArrayBuffer(hex.length / 2));
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
   }
   return bytes;
 }
 
-async function deriveBits(password: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+async function deriveBits(
+  password: string,
+  salt: Uint8Array<ArrayBuffer>,
+  iterations: number,
+): Promise<Uint8Array> {
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(password),
@@ -31,7 +35,7 @@ async function deriveBits(password: string, salt: Uint8Array, iterations: number
 }
 
 export async function hashPassword(password: string): Promise<string> {
-  const salt = new Uint8Array(SALT_BYTES);
+  const salt = new Uint8Array(new ArrayBuffer(SALT_BYTES));
   crypto.getRandomValues(salt);
   const derived = await deriveBits(password, salt, PBKDF2_ITERATIONS);
   return `pbkdf2$${PBKDF2_ITERATIONS}$${toHex(salt)}$${toHex(derived)}`;

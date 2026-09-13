@@ -26,14 +26,12 @@ export default function ProjectorPage() {
 
   useEffect(() => {
     fetch(`/api/sessions/${id}`)
-      .then((res) => (res.ok ? res.json() : null))
+      .then((res) => (res.ok ? (res.json() as Promise<SessionDetails>) : null))
       .then((data) => data && setSession(data));
 
     fetch(`/api/sessions/${id}/attendance`)
-      .then((res) => (res.ok ? res.json() : []))
-      .then((rows: { id: string; name: string }[]) =>
-        setAttendance(rows.map((row) => ({ id: row.id, name: row.name }))),
-      );
+      .then((res) => (res.ok ? (res.json() as Promise<AttendanceEntry[]>) : []))
+      .then((rows) => setAttendance(rows.map((row) => ({ id: row.id, name: row.name }))));
   }, [id]);
 
   useEffect(() => {

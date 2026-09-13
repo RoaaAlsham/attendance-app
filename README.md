@@ -60,8 +60,11 @@ convention-bound file, so there's no reason to nest it under `src/`.
   session creation), and the live projector page (this phase — see below).
 - ✅ **Phase 6 — Student flow (pages)**: the `/attend` page and
   `POST /api/attend` (this phase — see below).
-- ⬜ Phase 7 — Anti-fraud checks
-- ⬜ Phase 8 — Testing & deployment
+- ✅ **Phase 7 — Anti-fraud checks**: geofencing, per-IP rate limiting, and
+  a rejection audit log.
+- ✅ **Phase 8 — Testing**: end-to-end suites, production-build verification,
+  and the bugs they caught (this phase — see below). **Not yet deployed** —
+  see the deployment runbook at the end.
 
 ## Getting started
 
@@ -80,14 +83,18 @@ there's no separate "UI-only" dev mode to worry about.
 |---|---|
 | `npm run dev` | Start the vinext dev server (local workerd runtime, bindings live). |
 | `npm run build` | Build the Cloudflare Worker output. |
-| `npm run start` | Run the built Worker locally via Wrangler. |
+| `npm run start` | Run the built Worker locally via Wrangler, against the same local D1/DO state as `dev`. |
 | `npm run deploy` | Deploy to Cloudflare Workers. |
+| `npm run test:e2e <url>` | API/WebSocket end-to-end suite (63 checks). |
+| `npm run test:browser <url>` | Browser end-to-end suite (15 checks; needs `npx playwright install chromium` once). |
+| `npm run typecheck` | `tsc --noEmit`. |
 
 ## Data model
 
-Defined in [migrations/0001_init.sql](migrations/0001_init.sql) and
-[migrations/0002_auth_sessions.sql](migrations/0002_auth_sessions.sql),
-applied with Wrangler's D1 migration tooling.
+Defined in [migrations/0001_init.sql](migrations/0001_init.sql),
+[migrations/0002_auth_sessions.sql](migrations/0002_auth_sessions.sql), and
+[migrations/0003_anti_fraud.sql](migrations/0003_anti_fraud.sql), applied
+with Wrangler's D1 migration tooling.
 
 | Table | Purpose |
 |---|---|
@@ -96,6 +103,8 @@ applied with Wrangler's D1 migration tooling.
 | `sessions` | One lecture session for a course; optionally carries room coordinates (`room_lat`/`room_lng`) and a check-in radius (`radius_m`) for the Phase 7 geofence check. |
 | `attendance` | One row per student check-in. `UNIQUE(session_id, user_id)` enforces "one scan per student per session" at the database level. |
 | `auth_sessions` | One row per active login (Phase 3). Primary key is a SHA-256 hash of the opaque session token, never the token itself — same reasoning as `password_hash`. Named separately from `sessions` (lecture sessions) to avoid confusion. |
+| `attendance_flags` | One row per rejected `/api/attend` attempt flagged as suspicious (Phase 7): geofence or rate-limit rejections, with a `reason`. |
+| `attend_rate_limits` | One row per `(ip, minute bucket)` on `/api/attend`, incremented atomically per request (Phase 7). Not automatically purged — see below. |
 
 ### Working with migrations
 
@@ -175,7 +184,10 @@ and production.
 
 Every route above sits behind `src/middleware.ts`'s matcher, so an
 unauthenticated/wrong-role request never reaches the handler body — it's
-rejected with `401`/`403` first.
+rejected with `401`/`403` first. The one exception is the WebSocket upgrade
+at `/api/sessions/:id/ws`, which never reaches middleware at all; it is
+authorized directly in `worker/index.ts` and requires the session's owning
+lecturer.
 
 ## Authentication (Phase 3)
 
@@ -289,7 +301,10 @@ scoped to a single active session.
   matching `/api/sessions/:id/ws`, forwarding them to that session's DO
   stub; every other request is delegated unchanged to
   `vinext/server/app-router-entry`, so all of Next.js's own routing
-  (pages, Route Handlers, 404s) is unaffected.
+  (pages, Route Handlers, 404s) is unaffected. **It also authorizes the
+  socket** — because this path bypasses `src/middleware.ts` entirely, that
+  check has to live here or nowhere (see Phase 8: it originally lived
+  nowhere, and anyone with a session id could stream live QR tokens).
 - **`wrangler.jsonc`** — added the `durable_objects` binding (`SESSION` →
   `LectureSession`) and the required `migrations` entry
   (`new_sqlite_classes: ["LectureSession"]`) that registers the DO class
@@ -451,8 +466,8 @@ foreign keys are enforced).
   asks for the unique-constraint case to get special handling); on success,
   call `.../notify` with the student's name and return `201`. Also stores
   the optional `lat`/`lng` from the request body and `cf-connecting-ip` on
-  the row, ready for Phase 7 to actually use them — Phase 6 captures, it
-  doesn't yet enforce.
+  the row. (Phase 6 only captured `lat`/`lng`; Phase 7 below adds the checks
+  that actually use them.)
 - **`src/middleware.ts`** — added `/api/attend` to the matcher and a new
   `isStudentOnly()` (mirroring `isLecturerOnly()`) so a lecturer hitting
   `/api/attend` gets `403`, not a confusing pass-through into student-only
@@ -535,6 +550,248 @@ The temporary DO debug endpoint and its companion test route used to read
 the live token fast (same pattern as Phase 4) were removed after testing;
 all test accounts, courses, sessions, and attendance rows were deleted
 from the local D1 database afterward.
+
+## Anti-fraud checks (Phase 7)
+
+`src/app/api/attend/route.ts` gained two rejection layers, checked in this
+order (cheapest/least-trusting-of-input first): session validity → **rate
+limit** → **geofence** → token validity → insert. Both new layers write to
+`attendance_flags` when they reject a request, so rejected attempts have a
+durable record instead of just a transient error response.
+
+- **`src/lib/geo.ts`** — `haversineDistanceMeters(lat1, lng1, lat2, lng2)`,
+  standard great-circle distance in meters. No dependency — Workers has no
+  native geo library and this is ~15 lines of math.
+- **Geofence check** — only runs when the session has `room_lat`/`room_lng`
+  set (matching the plan: "when room coordinates were set"). If it's set,
+  the request is now *required* to include `lat`/`lng` too, and rejected
+  (`422 outside_geofence`) if either they're missing or the computed
+  distance exceeds `radius_m`. This is stricter than "only check distance
+  if coordinates are present on both sides" — the plan doesn't spell out
+  what happens when a geofenced session gets a request with no
+  coordinates, but allowing it through would make the entire feature
+  trivially bypassable: `/api/attend` is a plain JSON POST endpoint, not
+  something that can only be reached through the browser UI that happens
+  to ask for geolocation permission. Simply omitting `lat`/`lng` from a
+  hand-crafted request would defeat the check entirely if missing
+  coordinates were treated leniently.
+- **Rate limit** — `attend_rate_limits`, keyed by `${ip}:${minuteBucket}`,
+  incremented via `INSERT ... ON CONFLICT DO UPDATE SET count = count + 1
+  RETURNING count` (one atomic round-trip, no read-then-write race). Limit
+  is 10/minute per IP; exceeding it returns `429` and logs a
+  `rate_limited` flag. IP comes from `cf-connecting-ip` (set reliably by
+  Cloudflare's edge in production; unspoofable by the client there) with an
+  `"unknown"` fallback bucket for the rare case it's absent — which it
+  always is in local dev unless a test deliberately sets the header, since
+  Miniflare doesn't populate it itself (see "Verified" below).
+- **Logging** — `attendance_flags` only records the two checks this phase
+  introduces (`outside_geofence`, `rate_limited`), not routine invalid/
+  expired-token rejections from Phase 6. Those happen constantly under
+  normal use (the QR rotates every 10s; scanning the instant before
+  rotation is an everyday timing accident, not fraud) and logging every one
+  would bury the signal this table exists to capture.
+- **Known limitation, not required for this phase:** `attend_rate_limits`
+  rows are never purged — each `(ip, minute)` pair is permanent. Fine at
+  this app's scale; a Cron Trigger sweeping old rows would be the natural
+  follow-up, same "nice to have, not required for correctness" territory
+  as `auth_sessions`' lazy-only expiry (Phase 3).
+
+### Verified
+
+- **Geofence:** a scan from coordinates ~5,800 km away (London, against a
+  session room set to coordinates in NYC) → `422 outside_geofence`, logged
+  to `attendance_flags`. A scan with *no* `lat`/`lng` at all against the
+  same geofenced session → also `422 outside_geofence` (confirms the
+  "missing coordinates don't get a free pass" decision above actually
+  works, not just reads correctly). A scan from ~50m away with a valid
+  token → `201`, succeeds normally. A session created *without* room
+  coordinates → geofence check skipped entirely regardless of what
+  `lat`/`lng` the request sends (or doesn't) — confirmed with a real scan
+  that sends no coordinates and still succeeds.
+- **Rate limit:** 12 requests in a burst from one spoofed `CF-Connecting-IP`
+  → the first 10 processed normally (rejected on other grounds — no valid
+  token/coordinates supplied in the test — but *not* rate-limited), the
+  11th and 12th got `429`. A different IP, immediately after, was
+  unaffected — proceeded straight through to its own token check rather
+  than getting `429`, confirming the limit is scoped per-IP as the
+  acceptance criteria requires ("without affecting other students'
+  legitimate scans"). `attend_rate_limits` showed independent counters per
+  IP (`9.9.9.9` at 12, the untouched IP at 1) confirming there's no shared
+  global bucket.
+- Both flag reasons showed up correctly grouped in `attendance_flags`
+  (`GROUP BY reason`) after the above.
+- **Also fixed while verifying:** `outside_geofence` reuses the `422`
+  status code Phase 6 already used for `invalid_token`, and
+  `src/app/attend/attend-client.tsx` was only branching on HTTP status, not
+  the response body's `error` field — so a geofence rejection would have
+  rendered as "Invalid QR code," which is actively misleading (the QR is
+  fine; the student's location isn't). Fixed the client to check
+  `error === "outside_geofence"` within the `422` branch, added a distinct
+  message ("You're too far from the room") and a `429` → "Too many
+  attempts" state. Confirmed in a real browser with a mocked geolocation
+  ~5,800 km from the room.
+- Unlike Phase 4/6, this round didn't need the temporary DO debug endpoint
+  to read the live token fast — geofence and rate-limit rejections are
+  checked *before* token validation, so those tests work with any (even
+  garbage) token. The one test that needed a real valid token (a scan from
+  within range) just used the token from `Monitor`'s live `qr` WebSocket
+  event directly, immediately, in the same turn — same "read it as late as
+  possible" discipline as before, just without the extra debug-route
+  detour this time. All test accounts, courses, sessions, flags, and
+  rate-limit rows were deleted from the local D1 database afterward.
+
+## Testing (Phase 8)
+
+Two suites live in [tests/](tests/), both of which take a base URL so they can
+run against the dev server, the local production build, or a deployed instance:
+
+```bash
+npm run dev &                              # or: npm run build && npm run start
+npm run test:e2e     http://127.0.0.1:8787
+npm run test:browser http://127.0.0.1:8787
+```
+
+- **[tests/e2e.mjs](tests/e2e.mjs)** — 63 checks over the API and WebSocket
+  surface: auth, session revocation, course/session ownership, the Durable
+  Object token feed, the full attend flow, anti-fraud, concurrency, and page
+  routing. **Zero dependencies** — it uses Node's built-in `fetch` and
+  `WebSocket`, so it runs anywhere without an install step.
+- **[tests/browser-e2e.mjs](tests/browser-e2e.mjs)** — 15 checks driving a real
+  Chromium through the human flow: a lecturer logs in, creates a course, starts
+  a session, and the projector renders a QR; the test then **decodes that QR
+  image** with `jsqr` and navigates a second browser context to the URL it
+  actually contains. That's a genuine scan, not a shortcut through the
+  WebSocket token — it proves the QR encodes a working check-in link.
+  `playwright`, `jsqr`, and `pngjs` are devDependencies; the browser binary
+  itself needs a one-time `npx playwright install chromium`.
+
+Both run clean against the production build: **63/63 and 15/15**.
+
+### Bugs this phase found and fixed
+
+Everything before Phase 8 was only ever exercised through `npm run dev`.
+Building and running the real Worker surfaced three defects, two of them
+invisible in dev:
+
+1. **Unauthenticated clients could harvest live QR tokens** (the serious one).
+   `worker/index.ts` intercepts the WebSocket upgrade *before* vinext's
+   routing, which means `src/middleware.ts` never ran for it — so the socket
+   had no authentication at all. Anyone who knew a session id could subscribe
+   to the projector feed from anywhere and stream valid tokens as they
+   rotated, then check in remotely. That defeats the app's whole premise:
+   the rotating code is supposed to be worthless unless you can see the
+   screen. Fixed by authorizing the upgrade in `worker/index.ts` — it now
+   requires a valid session cookie whose user *owns* that lecture session,
+   matching the rule already enforced on `GET /api/sessions/:id/attendance`.
+   `tests/e2e.mjs` covers this with three regression checks (anonymous,
+   student, and non-owning lecturer all rejected).
+2. **`POST /api/auth/signup` reported every failure as "email already in
+   use."** Its `catch` block returned `409` for *any* error, so when the
+   production build ran against an unmigrated database, "no such table:
+   users" surfaced as a duplicate-email complaint. Post-deploy, forgetting
+   the remote migration would have produced exactly this lie. Now it only
+   claims a duplicate on an actual `UNIQUE constraint failed` and rethrows
+   anything else — the same pattern `/api/attend` already used.
+3. **Rejecting a POST without reading its body poisoned keep-alive
+   connections.** Middleware returned `401`/`403` without consuming the
+   request body, leaving unread bytes on the socket; the *next* request to
+   reuse that pooled connection failed with a 500. It reproduced as a clean
+   alternating 401 → 500 → 401 → 500 and affected every middleware-rejected
+   POST, not one route. Middleware now drains the body before any early
+   rejection.
+
+Two smaller things fixed at ship time: the landing page was still vinext
+scaffold copy with a dead link to `/api/hello` (deleted back in Phase 2), and
+the browser tab still read "vinext on Cloudflare Workers".
+
+### Notes for whoever runs these next
+
+- **`npm run start` used to run against an empty database.** `wrangler dev
+  --config dist/server/wrangler.json` resolves its local state relative to the
+  config file, so it was silently using `dist/server/.wrangler/` — a fresh,
+  unmigrated D1. The script now passes `--persist-to .wrangler/state` so the
+  built Worker shares the same local data as `npm run dev`.
+- **The dev server is too slow for timing-sensitive assertions on this
+  machine.** Individual `/api/attend` requests ranged from 0.5s to **16.5s**
+  under Vite/Miniflare on Windows. Against a 10-second token TTL, a batch of
+  concurrent scans can legitimately expire before the server even processes
+  them. The concurrency checks therefore assert *invariants* — one success
+  creates exactly one row and exactly one broadcast, and nothing ever returns
+  5xx — rather than exact counts, and retry a batch that wholly expired. The
+  production build has no such problem.
+- **Local Durable Object alarms jitter.** Rotation was observed at 10.5s and
+  15.9s intervals locally, so tests wait up to 35s for a fresh token. Worth
+  knowing: if an alarm fires late, the on-screen QR is briefly past its stated
+  expiry, and a scan in that window is correctly rejected as `expired`.
+- `npx vinext check` reports **100% compatible** (7 supported, 0 issues), and
+  `npx vinext-cloudflare deploy --dry-run` validates the setup (App Router
+  detected, ISR detected) without building or deploying.
+
+## Deploying
+
+**Not yet deployed.** Run these in order from the project root.
+
+**1. Create the KV namespace — required, and currently a blocker.**
+`wrangler.jsonc` still carries the scaffold placeholder
+`"id": "<your-kv-namespace-id>"`, which a real deploy will reject. It works
+locally only because Miniflare simulates KV regardless of the id. The binding
+is load-bearing: vinext uses it for the ISR data cache, and `/` sets
+`revalidate = 300`.
+
+```bash
+npx wrangler kv namespace create VINEXT_KV_CACHE
+```
+
+Paste the returned id into `wrangler.jsonc` in place of the placeholder.
+
+**2. Authenticate and confirm the account.**
+
+```bash
+npx wrangler login          # or: export CLOUDFLARE_API_TOKEN=...
+npx wrangler whoami
+```
+
+If the token maps to more than one account, add `"account_id": "<id>"` to
+`wrangler.jsonc` or set `CLOUDFLARE_ACCOUNT_ID`.
+
+**3. Migrate the production database.** All three migrations must run, or
+signup and every other write will fail against an empty schema.
+
+```bash
+npx wrangler d1 migrations apply attendance --remote
+npx wrangler d1 execute attendance --remote --command "SELECT name FROM sqlite_master WHERE type='table'"
+```
+
+**4. Secrets: none.** The opaque-session design signs nothing, so there is no
+`SESSION_SECRET` to provision. If you add one later:
+`npx wrangler secret put <NAME>`.
+
+**5. Build and deploy.**
+
+```bash
+npm run build
+npm run deploy
+```
+
+To rehearse without shipping: `npx vinext-cloudflare deploy --dry-run`.
+
+**6. Smoke-test the deployed URL with the same suites.**
+
+```bash
+npm run test:e2e https://attendance-app.<your-subdomain>.workers.dev
+```
+
+⚠️ This creates real rows (users prefixed `e2e-`, plus courses, sessions, and
+attendance) in the production database. Point it at a preview deployment
+(`npx vinext-cloudflare deploy --preview`) if you'd rather not, or clean up
+afterwards — every account it makes is prefixed `e2e-` and every browser-suite
+account `bx-`.
+
+One deployed-only check worth doing by hand, since it can't be verified
+locally: confirm the session cookie's `Secure` attribute now works in a real
+browser (over HTTPS it will be stored; over plain `http://localhost` browsers
+refuse it — which is why local browser testing has always gone through
+Playwright).
 
 ## Configuration notes
 

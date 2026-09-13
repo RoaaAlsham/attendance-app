@@ -16,8 +16,12 @@ export async function POST(req: Request) {
     await env.DB.prepare(
       "INSERT INTO users (id, name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)"
     ).bind(id, name, email, passwordHash, role).run();
-  } catch {
-    return Response.json({ error: "email already in use" }, { status: 409 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("UNIQUE constraint failed")) {
+      return Response.json({ error: "email already in use" }, { status: 409 });
+    }
+    throw err;
   }
 
   return Response.json({ id, name, email, role }, { status: 201 });

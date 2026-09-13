@@ -5,5 +5,6 @@ next-env.d.ts
 /dist/
 .vinext/
 .wrangler/
+tsconfig.tsbuildinfo
 attendance-app-implementation-plan*.md
 attendance-app-implementation-plan-v2.md

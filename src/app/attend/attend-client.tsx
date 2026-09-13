@@ -8,6 +8,8 @@ type Result =
   | { status: "success" }
   | { status: "already" }
   | { status: "invalid"; reason?: string }
+  | { status: "outside_geofence" }
+  | { status: "rate_limited" }
   | { status: "session_ended" }
   | { status: "unauthorized" }
   | { status: "forbidden" }
@@ -55,8 +57,10 @@ export default function AttendClient() {
     if (res.status === 401) return setResult({ status: "unauthorized" });
     if (res.status === 403) return setResult({ status: "forbidden" });
     if (res.status === 410) return setResult({ status: "session_ended" });
+    if (res.status === 429) return setResult({ status: "rate_limited" });
     if (res.status === 422) {
-      const data = (await res.json()) as { reason?: string };
+      const data = (await res.json()) as { error?: string; reason?: string };
+      if (data.error === "outside_geofence") return setResult({ status: "outside_geofence" });
       return setResult({ status: "invalid", reason: data.reason });
     }
     setResult({ status: "error" });
@@ -89,6 +93,22 @@ export default function AttendClient() {
               {result.reason === "expired" ? "This QR code expired" : "Invalid QR code"}
             </p>
             <p className="text-sm text-slate-600">Ask the lecturer for a fresh code, then scan again.</p>
+          </>
+        )}
+
+        {result.status === "outside_geofence" && (
+          <>
+            <p className="text-3xl">📍</p>
+            <p className="text-lg font-medium">You&apos;re too far from the room</p>
+            <p className="text-sm text-slate-600">Move closer to the lecture room, then scan again.</p>
+          </>
+        )}
+
+        {result.status === "rate_limited" && (
+          <>
+            <p className="text-3xl">⏳</p>
+            <p className="text-lg font-medium">Too many attempts</p>
+            <p className="text-sm text-slate-600">Wait a moment, then try again.</p>
           </>
         )}
 
