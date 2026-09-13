@@ -26,9 +26,12 @@ export async function middleware(req: NextRequest) {
 
 async function unauthorized(req: NextRequest) {
   await drainBody(req);
-  return req.nextUrl.pathname.startsWith("/api/")
-    ? new NextResponse(null, { status: 401 })
-    : NextResponse.redirect(new URL("/login", req.url));
+  if (req.nextUrl.pathname.startsWith("/api/")) {
+    return new NextResponse(null, { status: 401 });
+  }
+  const loginUrl = new URL("/login", req.url);
+  loginUrl.searchParams.set("next", req.nextUrl.pathname + req.nextUrl.search);
+  return NextResponse.redirect(loginUrl);
 }
 
 async function forbidden(req: NextRequest) {

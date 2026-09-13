@@ -22,6 +22,13 @@ export default function AttendClient() {
   const token = searchParams.get("token");
   const [result, setResult] = useState<Result>({ status: "loading" });
 
+  // Where to send the student back to once they've logged in — this exact
+  // scan, not the homepage. sessionId/token are only missing in the
+  // "missing_params" state, which never renders the login link that uses this.
+  const loginNext = sessionId && token
+    ? `/login?next=${encodeURIComponent(`/attend?session=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`)}`
+    : "/login";
+
   useEffect(() => {
     if (!sessionId || !token) {
       setResult({ status: "missing_params" });
@@ -123,8 +130,8 @@ export default function AttendClient() {
           <>
             <p className="text-3xl">🔒</p>
             <p className="text-lg font-medium">Log in to check in</p>
-            <a href="/login" className="text-sm text-slate-700 underline">
-              Log in
+            <a href={loginNext} className="text-sm text-slate-700 underline">
+              Log in, then come back here to finish checking in
             </a>
           </>
         )}
