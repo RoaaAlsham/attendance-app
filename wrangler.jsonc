@@ -5,7 +5,7 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-	"main": "vinext/server/fetch-handler",
+	"main": "worker/index.ts",
 	"assets": {
 		"directory": "dist/client",
 		"not_found_handling": "none",
@@ -29,5 +29,13 @@
 			"database_name": "attendance",
 			"database_id": "62851a04-7aff-4ee9-9e8a-5d3af3cf5ff5"
 		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "SESSION", "class_name": "LectureSession" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["LectureSession"] }
 	]
 }

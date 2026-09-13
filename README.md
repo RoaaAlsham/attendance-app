@@ -17,8 +17,8 @@ original plan, revising Phase 3's session design (see below).
   no Node.js server, no separate build-then-adapt step.
 - **D1** (SQLite at the edge) for relational data: users, courses, sessions,
   attendance records.
-- **Durable Objects** (added in a later phase) for the rotating QR token and
-  the live WebSocket feed to the projector/dashboard.
+- **Durable Objects** — one `LectureSession` DO per lecture session, rotating
+  the QR token and driving the live WebSocket feed to the projector/dashboard.
 - **Wrangler** for local dev bindings, migrations, and deployment.
 
 ## Project status
@@ -31,7 +31,9 @@ original plan, revising Phase 3's session design (see below).
   as a Route Handler.
 - ✅ **Phase 3 — Authentication**: opaque, DB-backed session tokens with
   real revocation (this phase — see below).
-- ⬜ Phase 4 — Durable Object + custom worker
+- ✅ **Phase 4 — Durable Object + custom worker**: `LectureSession` DO
+  rotates a QR token every ~10s over a WebSocket, with token validation and
+  attendance-notify broadcasting (this phase — see below).
 - ⬜ Phase 5 — Lecturer flow (pages)
 - ⬜ Phase 6 — Student flow (pages)
 - ⬜ Phase 7 — Anti-fraud checks
@@ -122,9 +124,9 @@ invariant later phases (the `/api/attend` route) rely on to detect
 
 Every endpoint from the plan exists as a Route Handler under `app/api/`.
 There is deliberately no route for the WebSocket channel
-(`/api/sessions/:id/ws`); Phase 4 handles that in a custom worker entry
-(`worker/index.ts`) that intercepts it before the request reaches Next.js
-routing.
+(`/api/sessions/:id/ws`); it's handled by the custom worker entry
+(`worker/index.ts`) added in Phase 4, which intercepts it before the request
+reaches Next.js routing — see below.
 
 | Method | Path | Auth | Status |
 |---|---|---|---|
@@ -192,7 +194,9 @@ root (not `src/app/`), and Next.js requires `middleware.ts` to sit beside
 `app/`, not inside a `src/` that `app/` isn't part of — plus the `@/*`
 tsconfig path alias already resolves to the project root, matching the
 plan's own `@/lib/session` import literally. So `lib/` and `middleware.ts`
-were placed at the repo root instead. Confirmed working: `npm run dev` logs
+were placed at the repo root instead (and `durable-objects/` in Phase 4,
+for the same reason — no `src/` directory exists elsewhere in the project
+to nest it under). Confirmed working: `npm run dev` logs
 that it found and loaded `middleware.ts` (with a "middleware is deprecated,
 use proxy" notice — see below), and the auth behavior it implements was
 verified end-to-end.
@@ -227,10 +231,99 @@ name if the project moves to embrace that convention.
   request with that cookie got `401`, and the row was purged from the table
   as a side effect of that lookup (lazy cleanup, as designed).
 
+## Real-time layer (Phase 4)
+
+One `LectureSession` Durable Object instance exists per lecture session
+(addressed by `env.SESSION.idFromName(sessionId)`), holding the current QR
+token in its own storage — not D1, since it's short-lived, high-churn, and
+scoped to a single active session.
+
+- **`durable-objects/lecture-session.ts`** — the `LectureSession` class,
+  extending `DurableObject` from `cloudflare:workers`:
+  - `alarm()` rotates the token (`crypto.randomUUID()`) every 10 seconds,
+    persists `{ token, tokenExpiresAt }` via `this.ctx.storage`, reschedules
+    itself, and broadcasts `{ type: "qr", token }` to every WebSocket tagged
+    `projector`.
+  - `fetch()` handles three cases on one Durable Object, distinguished by
+    path suffix (see "A routing detail" below): `GET .../ws?role=projector|lecturer`
+    upgrades the connection via the WebSocket Hibernation API
+    (`this.ctx.acceptWebSocket(server, [role])`, tagged by role so broadcasts
+    can target one audience); `POST .../validate` checks a submitted token
+    against the current one, returning `{ valid, reason? }`; `POST .../notify`
+    broadcasts `{ type: "attendance", studentName }` to `lecturer`-tagged
+    sockets only.
+- **`worker/index.ts`** — the custom Workers entry point now pointed at by
+  `wrangler.jsonc`'s `main` (previously `vinext/server/fetch-handler`).
+  It exports the `LectureSession` class (required for Wrangler to discover
+  it as a Durable Object) and intercepts only WebSocket-upgrade requests
+  matching `/api/sessions/:id/ws`, forwarding them to that session's DO
+  stub; every other request is delegated unchanged to
+  `vinext/server/app-router-entry`, so all of Next.js's own routing
+  (pages, Route Handlers, 404s) is unaffected.
+- **`wrangler.jsonc`** — added the `durable_objects` binding (`SESSION` →
+  `LectureSession`) and the required `migrations` entry
+  (`new_sqlite_classes: ["LectureSession"]`) that registers the DO class
+  with Wrangler's storage layer.
+
+### A routing detail not spelled out in the plan
+
+`worker/index.ts` forwards the *original* incoming request unchanged to the
+DO stub — so inside `LectureSession.fetch()`, a WebSocket upgrade arrives
+with the full external pathname (`/api/sessions/<id>/ws`), not a bare `/ws`.
+Meanwhile, application code calling the DO directly for non-WS operations
+(e.g. the future `/api/attend` route calling `.../validate`) can use any
+synthetic same-origin URL it likes, since that request never leaves the
+Workers runtime. The DO's path matching therefore checks
+`pathname.endsWith("/ws")` / `.endsWith("/validate")` / `.endsWith("/notify")`
+rather than exact equality, so it handles both call shapes correctly. Using
+exact-match initially caused every WebSocket upgrade to fall through to the
+DO's 404 branch — and because workerd can't cleanly turn a non-101 response
+into a real HTTP reply for a connection that already sent `Upgrade:
+websocket` headers, that surfaced as a raw connection reset ("empty reply
+from server"), not an HTTP 404. Worth knowing if this ever regresses.
+
+### Verified manually against `npm run dev`
+
+- **WebSocket upgrade**: a raw HTTP handshake against
+  `ws://localhost:3000/api/sessions/<id>/ws?role=projector` returns
+  `101 Switching Protocols`, and connecting for real receives a `{"type":"qr","token":...}`
+  message immediately, then a new one roughly every 10 seconds (observed 4
+  rotations across the same connection).
+- **Non-WS routing is unaffected**: `/api/health`, `/api/me` (401 with no
+  cookie), and an unmapped path (404) all still resolve correctly through
+  Next.js routing with the custom worker entry in place.
+- **`/validate`**: fetched the DO's live in-memory token and validated it in
+  the same fast round-trip — a matching token returns `{"valid":true}`; a
+  wrong one returns `{"valid":false,"reason":"mismatched token"}`.
+- **Role isolation**: a `role=lecturer` socket receives `/notify`'s
+  `{"type":"attendance",...}` broadcast; a `role=projector` socket on the
+  same session does not — confirming `getWebSockets(tag)` broadcasts are
+  correctly scoped by role.
+- **`reason: "expired"` is real but rarely observed in practice**: it exists
+  in `handleValidate` for a token whose `tokenExpiresAt` has passed but the
+  alarm hasn't rotated it out yet. Because the same 10s alarm that expires a
+  token is also what replaces it, in normal operation a stale token almost
+  always reads as `"mismatched token"` (compared against the token that
+  already replaced it) rather than `"expired"` — the "current token exists,
+  is stale, but not yet superseded" window is a race that this design
+  doesn't need to widen. Either reason correctly rejects the scan, which is
+  what the acceptance criteria call for.
+- Verification used a temporary debug endpoint on the DO
+  (`.../debug-state`, returning the raw stored state) and two throwaway
+  route files under `app/api/dev-test-*` to reach it from outside the
+  Workers runtime — both were removed after testing; they aren't part of
+  the shipped code.
+
 ## Configuration notes
 
 - The D1 binding in `wrangler.jsonc` is named `DB` (matching `env.DB` used
   throughout the plan/codebase) — this was renamed from the scaffold
   default during Phase 1 for consistency with later phases.
+- `wrangler.jsonc`'s `main` points at `worker/index.ts` (Phase 4), not the
+  scaffold's `vinext/server/fetch-handler` — this is what lets the custom
+  worker export the `LectureSession` Durable Object and intercept the
+  WebSocket route. `vite.config.ts`'s `cloudflare()` plugin reads `main`
+  from `wrangler.jsonc` automatically, so it needed no changes.
 - Run `npx wrangler types` after any change to `wrangler.jsonc` bindings to
-  keep `worker-configuration.d.ts`'s `Env` type in sync.
+  keep `worker-configuration.d.ts`'s `Env` type in sync (needed again after
+  adding the `SESSION` Durable Object binding).
