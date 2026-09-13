@@ -10,6 +10,27 @@ See `attendance-app-implementation-plan-v2.md` (git-ignored, local only) for
 the full phased implementation plan this project follows. v2 supersedes the
 original plan, revising Phase 3's session design (see below).
 
+## Project structure
+
+Follows Next.js's standard `src/` convention (vinext auto-detects `src/app`
+when there's no root-level `app/`), matching the plan's target layout:
+
+```
+attendance-app/
+  worker/index.ts            # custom Workers entry: exports the DO, intercepts /ws
+  wrangler.jsonc
+  migrations/
+  src/
+    app/                     # pages + Route Handlers (Next.js App Router)
+    lib/                     # session.ts, password.ts
+    durable-objects/         # lecture-session.ts
+    middleware.ts
+```
+
+`worker/` stays at the repo root, alongside `wrangler.jsonc` and
+`vite.config.ts` — it's a Cloudflare Workers entry point, not a Next.js
+convention-bound file, so there's no reason to nest it under `src/`.
+
 ## Stack
 
 - **Next.js (App Router)** served through **vinext**, Cloudflare's Vite
@@ -101,7 +122,7 @@ npx wrangler d1 execute attendance --local --file=./scripts/seed.sql
 Their `password_hash` values are placeholders (`'placeholder-hash'`), not
 real PBKDF2 hashes — they won't pass `POST /api/auth/login`. Sign up through
 the API instead to get a working test account, or re-seed with a real hash
-produced by `hashPassword()` from [lib/password.ts](lib/password.ts).
+produced by `hashPassword()` from [src/lib/password.ts](src/lib/password.ts).
 
 | Role | Email | id |
 |---|---|---|
@@ -122,7 +143,7 @@ invariant later phases (the `/api/attend` route) rely on to detect
 
 ## API routes
 
-Every endpoint from the plan exists as a Route Handler under `app/api/`.
+Every endpoint from the plan exists as a Route Handler under `src/app/api/`.
 There is deliberately no route for the WebSocket channel
 (`/api/sessions/:id/ws`); it's handled by the custom worker entry
 (`worker/index.ts`) added in Phase 4, which intercepts it before the request
@@ -148,7 +169,7 @@ Bindings (D1, and later KV/DO) are read directly via
 wrapper/adapter layer, since vinext exposes bindings natively in both dev
 and production.
 
-"Auth-checked" stubs sit behind `middleware.ts`'s matcher, so an
+"Auth-checked" stubs sit behind `src/middleware.ts`'s matcher, so an
 unauthenticated/wrong-role request never reaches the `501` body — it's
 rejected with `401`/`403` first. `/api/sessions` (POST) and `/api/attend`
 aren't in the matcher yet (their auth requirements are implemented alongside
@@ -164,18 +185,18 @@ opaque token is a random string that's meaningless without a matching row in
 `auth_sessions`, so logging out deletes that row and the token is dead
 everywhere it exists, immediately — not just in the browser that logged out.
 
-- **`lib/password.ts`** — `hashPassword`/`verifyPassword` using
+- **`src/lib/password.ts`** — `hashPassword`/`verifyPassword` using
   `crypto.subtle` PBKDF2 (100,000 iterations, SHA-256, random 16-byte salt
   per user). No npm `bcrypt`, since it needs Node natives unavailable in the
   Workers runtime.
-- **`lib/session.ts`** — `createSession`, `verifySession`, `revokeSession`,
+- **`src/lib/session.ts`** — `createSession`, `verifySession`, `revokeSession`,
   `revokeAllSessionsForUser`. Tokens are 32 random bytes (base64url-encoded);
   only a SHA-256 hash of the token is ever stored, in the `auth_sessions`
   table added by [migrations/0002_auth_sessions.sql](migrations/0002_auth_sessions.sql).
   Sessions last 7 days and are checked (and lazily purged if expired) on
   every use — nothing is embedded in the token itself, so a role change
   takes effect on the user's very next request.
-- **`middleware.ts`** — looks up the session cookie against D1 on every
+- **`src/middleware.ts`** — looks up the session cookie against D1 on every
   matched request, then forwards the verified identity to route handlers via
   `x-user-id`/`x-user-role` request headers (middleware can't hand a JS
   object to a Route Handler directly).
@@ -186,20 +207,19 @@ everywhere it exists, immediately — not just in the browser that logged out.
   instance. Switch to a real browser test once TLS is in place, or drop
   `Secure` locally if you need to click through the flow in dev before then.
 
-### Deviations from the plan's literal file paths
+### A note on project layout history
 
-The plan's project-structure diagram nests library code under `src/lib/` and
-`src/middleware.ts`, but this project's `app/` directory lives at the repo
-root (not `src/app/`), and Next.js requires `middleware.ts` to sit beside
-`app/`, not inside a `src/` that `app/` isn't part of — plus the `@/*`
-tsconfig path alias already resolves to the project root, matching the
-plan's own `@/lib/session` import literally. So `lib/` and `middleware.ts`
-were placed at the repo root instead (and `durable-objects/` in Phase 4,
-for the same reason — no `src/` directory exists elsewhere in the project
-to nest it under). Confirmed working: `npm run dev` logs
-that it found and loaded `middleware.ts` (with a "middleware is deprecated,
-use proxy" notice — see below), and the auth behavior it implements was
-verified end-to-end.
+Phases 3–4 originally placed `lib/`, `middleware.ts`, and `durable-objects/`
+at the repo root, because at the time `app/` also lived at the root (not
+`src/app/`) and Next.js requires `middleware.ts` to sit beside wherever
+`app/` actually is. The project was later reorganized to move `app/` under
+`src/app/` too — matching both the plan's diagram and Next.js's standard
+`src/` convention — which let `lib/`, `middleware.ts`, and `durable-objects/`
+move under `src/` as originally intended. vinext auto-detects `src/app`
+(falling back to a root-level `app/` only if `src/app` doesn't exist), so no
+framework configuration changed; the `@/*` tsconfig path alias was
+repointed from `./*` to `./src/*` so `@/lib/session`-style imports keep
+resolving. Re-verified end-to-end after the move (see below).
 
 The plan's example `middleware.ts` matcher (`/api/courses`, `/api/sessions`,
 `/dashboard`) omits `/api/me`, even though the API contract marks it
@@ -238,7 +258,7 @@ One `LectureSession` Durable Object instance exists per lecture session
 token in its own storage — not D1, since it's short-lived, high-churn, and
 scoped to a single active session.
 
-- **`durable-objects/lecture-session.ts`** — the `LectureSession` class,
+- **`src/durable-objects/lecture-session.ts`** — the `LectureSession` class,
   extending `DurableObject` from `cloudflare:workers`:
   - `alarm()` rotates the token (`crypto.randomUUID()`) every 10 seconds,
     persists `{ token, tokenExpiresAt }` via `this.ctx.storage`, reschedules
@@ -310,9 +330,11 @@ from server"), not an HTTP 404. Worth knowing if this ever regresses.
   what the acceptance criteria call for.
 - Verification used a temporary debug endpoint on the DO
   (`.../debug-state`, returning the raw stored state) and two throwaway
-  route files under `app/api/dev-test-*` to reach it from outside the
+  route files under `src/app/api/dev-test-*` to reach it from outside the
   Workers runtime — both were removed after testing; they aren't part of
   the shipped code.
+- After the `src/` reorganization, re-ran the same checks (`/api/health`,
+  404 handling, the WS handshake returning `101`) to confirm nothing broke.
 
 ## Configuration notes
 
@@ -327,3 +349,5 @@ from server"), not an HTTP 404. Worth knowing if this ever regresses.
 - Run `npx wrangler types` after any change to `wrangler.jsonc` bindings to
   keep `worker-configuration.d.ts`'s `Env` type in sync (needed again after
   adding the `SESSION` Durable Object binding).
+- `tsconfig.json`'s `@/*` path alias points at `./src/*`, matching the
+  `src/` layout — `@/lib/session` resolves to `src/lib/session.ts`.

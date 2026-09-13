@@ -1,5 +1,5 @@
 import handler from "vinext/server/app-router-entry";
-import { LectureSession } from "../durable-objects/lecture-session";
+import { LectureSession } from "../src/durable-objects/lecture-session";
 
 export { LectureSession };
 
