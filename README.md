@@ -58,7 +58,8 @@ convention-bound file, so there's no reason to nest it under `src/`.
   attendance-notify broadcasting (this phase — see below).
 - ✅ **Phase 5 — Lecturer flow (pages)**: login, dashboard (course +
   session creation), and the live projector page (this phase — see below).
-- ⬜ Phase 6 — Student flow (pages)
+- ✅ **Phase 6 — Student flow (pages)**: the `/attend` page and
+  `POST /api/attend` (this phase — see below).
 - ⬜ Phase 7 — Anti-fraud checks
 - ⬜ Phase 8 — Testing & deployment
 
@@ -164,18 +165,17 @@ reaches Next.js routing — see below.
 | GET | `/api/sessions/:id` | session | ✅ implemented |
 | POST | `/api/sessions/:id/end` | lecturer | ✅ implemented |
 | GET | `/api/sessions/:id/attendance` | lecturer | ✅ implemented |
-| POST | `/api/attend` | student | stub |
+| POST | `/api/attend` | student | ✅ implemented |
 
-Bindings (D1, and later KV/DO) are read directly via
+Every Route Handler from the plan is now implemented — nothing left is a
+`501` stub. Bindings (D1, and later KV/DO) are read directly via
 `import { env } from "cloudflare:workers"` inside route handlers — no
 wrapper/adapter layer, since vinext exposes bindings natively in both dev
 and production.
 
 Every route above sits behind `src/middleware.ts`'s matcher, so an
 unauthenticated/wrong-role request never reaches the handler body — it's
-rejected with `401`/`403` first. `/api/attend` is the only remaining stub,
-and is the one route not yet in the matcher (its auth requirement lands
-with its real logic in Phase 6).
+rejected with `401`/`403` first.
 
 ## Authentication (Phase 3)
 
@@ -232,8 +232,11 @@ The plan's example `isLecturerOnly()` also only covers `/dashboard` and
 `POST /api/sessions/:id/end`, and `GET /api/sessions/:id/attendance` real
 logic, since the API contract marks all three lecturer-only too. Extended
 `isLecturerOnly()` to cover them by path-suffix + method (`GET /api/sessions/:id`
-stays open to any authenticated session, matching the contract). `/api/attend`
-stays unmatched until Phase 6 gives it real logic.
+stays open to any authenticated session, matching the contract). Phase 6
+added a symmetric `isStudentOnly()` (just `POST /api/attend`) and added
+`/api/attend` to the matcher, so every route in the API contract table is
+now both authenticated *and* role-checked at the edge, not just the ones
+that happened to need it first.
 
 **Known non-blocking notice:** the dev server logs `The "middleware" file
 convention is deprecated. Please use "proxy" instead` (Next.js 16 renamed
@@ -326,15 +329,15 @@ from server"), not an HTTP 404. Worth knowing if this ever regresses.
   `{"type":"attendance",...}` broadcast; a `role=projector` socket on the
   same session does not — confirming `getWebSockets(tag)` broadcasts are
   correctly scoped by role.
-- **`reason: "expired"` is real but rarely observed in practice**: it exists
-  in `handleValidate` for a token whose `tokenExpiresAt` has passed but the
-  alarm hasn't rotated it out yet. Because the same 10s alarm that expires a
-  token is also what replaces it, in normal operation a stale token almost
-  always reads as `"mismatched token"` (compared against the token that
-  already replaced it) rather than `"expired"` — the "current token exists,
-  is stale, but not yet superseded" window is a race that this design
-  doesn't need to widen. Either reason correctly rejects the scan, which is
-  what the acceptance criteria call for.
+- **`reason: "expired"` was originally real but rarely observed in
+  practice** (as first implemented here in Phase 4): it existed in
+  `handleValidate` only for a token whose `tokenExpiresAt` had passed but
+  the alarm hadn't rotated it out yet. Because the same 10s alarm that
+  expires a token is also what replaces it, in normal operation a stale
+  token almost always read as `"mismatched token"` (compared against the
+  token that already replaced it) rather than `"expired"`. Phase 6 fixes
+  this properly — see below — since its acceptance criteria specifically
+  requires a reliable "expired, scan again" message.
 - Verification used a temporary debug endpoint on the DO
   (`.../debug-state`, returning the raw stored state) and two throwaway
   route files under `src/app/api/dev-test-*` to reach it from outside the
@@ -435,6 +438,103 @@ Test lecturer/student accounts, the test course, and its sessions were all
 deleted from the local D1 database after verification (in dependency order:
 `attendance` → `sessions` → `courses` → `auth_sessions` → `users`, since
 foreign keys are enforced).
+
+## Student flow (Phase 6)
+
+- **`src/app/api/attend/route.ts`** — the last real endpoint in the API
+  contract. In order: reject if the session doesn't exist (`404`) or has
+  ended (`410`); call the session's DO `.../validate` with the submitted
+  token; if invalid, return `422` with the DO's `reason` passed through
+  (`"expired"` or `"mismatched token"`); attempt the `attendance` insert;
+  catch a `UNIQUE constraint failed` specifically and return `409
+  already_scanned` (anything else rethrows to a normal 500 — the plan only
+  asks for the unique-constraint case to get special handling); on success,
+  call `.../notify` with the student's name and return `201`. Also stores
+  the optional `lat`/`lng` from the request body and `cf-connecting-ip` on
+  the row, ready for Phase 7 to actually use them — Phase 6 captures, it
+  doesn't yet enforce.
+- **`src/middleware.ts`** — added `/api/attend` to the matcher and a new
+  `isStudentOnly()` (mirroring `isLecturerOnly()`) so a lecturer hitting
+  `/api/attend` gets `403`, not a confusing pass-through into student-only
+  logic.
+- **`src/app/attend/page.tsx`** + **`src/app/attend/attend-client.tsx`** —
+  split into a server component wrapping a `"use client"` child in
+  `<Suspense>`, because `useSearchParams()` requires a Suspense boundary in
+  the App Router (an easy miss — Next.js only warns about it, doesn't
+  error, so it's the kind of thing that looks fine in dev and then isn't).
+  The client component reads `session`/`token` from the query string,
+  optionally grabs `navigator.geolocation` (best-effort — check-in proceeds
+  without it if denied or unavailable), `POST`s to `/api/attend`, and maps
+  every response into one of: success, already recorded, invalid/expired
+  (with reason-specific text), session ended, not logged in, wrong role
+  (only students can check in), or missing scan details (no `session`/
+  `token` in the URL at all — e.g. someone opened `/attend` directly).
+
+### A real bug this phase's acceptance criteria caught: `reason: "expired"` wasn't reliable
+
+Phase 6's acceptance criteria requires "an expired QR (wait >10s) gives an
+explicit 'expired, scan again' message" — and testing that honestly (not
+just checking the code path exists, but actually waiting out a real token
+and scanning it) surfaced that Phase 4's `handleValidate` essentially never
+returned `"expired"` in practice, for the reason described in the Phase 4
+section above: by the time a token is >10s old, the alarm has already
+rotated it out, so it reads as `"mismatched token"` against its successor
+instead. Fixed by having `LectureSession` remember one generation of
+`previousToken` and treating a match against it as `"expired"` (not
+`"mismatched"`) regardless of the current token's own expiry — see
+[src/durable-objects/lecture-session.ts](src/durable-objects/lecture-session.ts).
+This only tracks one rotation back, so a token more than ~20s stale falls
+back to the generic `"mismatched token"` reason — acceptable, since the
+plan's test scenario is "wait >10s," not "wait an arbitrary amount," and
+either reason correctly rejects the scan either way.
+
+### Verified
+
+curl, against a fresh session each time to avoid cross-test interference
+(and a fast in-Workers debug endpoint on the DO to read its live token
+without racing the 10s rotation from outside — see below):
+
+- Fresh scan → `201`, row appears in `attendance` with the submitted
+  `lat`/`lng`.
+- Immediate repeat scan with the *same still-valid* token → `409
+  already_scanned` (not a duplicate row, not a crash).
+- A token, captured, then used again after actually waiting past its 10s
+  TTL → `422` with `reason: "expired"` (reliably, after the fix above —
+  confirmed on a fresh session after restarting the dev server, since
+  Durable Object class changes don't hot-reload into already-running
+  instances the same way Route Handlers do — the same thing Phase 4 first
+  ran into).
+- A garbage token → `422` with `reason: "mismatched token"`.
+- A lecturer calling `/api/attend` → `403`. No session cookie at all →
+  `401`. Missing `sessionId`/`token` in the body → `400`. A session id
+  that doesn't exist → `404`. A scan against an ended session → `410`.
+
+Then the actual page, in a real browser (Playwright, same approach as
+Phase 5): logged in as a student, navigated to
+`/attend?session=<id>&token=<token>` with a freshly-fetched valid token,
+and confirmed each state renders correctly — screenshotted "You're checked
+in", "Already recorded" (on a second visit), and "Missing scan details"
+(visiting `/attend` with no query params). One test-harness gotcha: the
+first attempt at capturing "already recorded" actually raced the 10s
+rotation *inside the login flow itself* (logging in takes a few real
+seconds), so by the time the page navigated the token had already expired
+twice over — not an app bug, just confirming the same fast-round-trip
+discipline from Phase 4/5 testing (fetch the token as late as possible,
+immediately before the request that uses it) applies here too.
+
+**Also fixed in passing:** `src/app/login/page.tsx` unconditionally
+redirected to `/dashboard` after login, which is lecturer-only —
+a student landed on a blank `403`. Login now reads the `role` from the
+login response and redirects lecturers to `/dashboard`, students to `/`
+(there's no student-specific landing page anywhere in the plan; `/` is a
+neutral choice since students reach the app's real content by scanning a
+QR, not by browsing to a dashboard). Caught only because Phase 6's browser
+test actually logged in as a student for the first time in this project.
+
+The temporary DO debug endpoint and its companion test route used to read
+the live token fast (same pattern as Phase 4) were removed after testing;
+all test accounts, courses, sessions, and attendance rows were deleted
+from the local D1 database afterward.
 
 ## Configuration notes
 

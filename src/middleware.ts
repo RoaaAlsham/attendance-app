@@ -3,7 +3,7 @@ import type { NextRequest } from "next/server";
 import { verifySession } from "@/lib/session";
 
 export const config = {
-  matcher: ["/api/courses/:path*", "/api/sessions/:path*", "/api/me", "/dashboard/:path*"],
+  matcher: ["/api/courses/:path*", "/api/sessions/:path*", "/api/me", "/api/attend", "/dashboard/:path*"],
 };
 
 export async function middleware(req: NextRequest) {
@@ -16,6 +16,9 @@ export async function middleware(req: NextRequest) {
   headers.set("x-user-role", identity.role);
 
   if (isLecturerOnly(req) && identity.role !== "lecturer") {
+    return new NextResponse(null, { status: 403 });
+  }
+  if (isStudentOnly(req) && identity.role !== "student") {
     return new NextResponse(null, { status: 403 });
   }
   return NextResponse.next({ request: { headers } });
@@ -34,4 +37,8 @@ function isLecturerOnly(req: NextRequest) {
     || (pathname === "/api/sessions" && req.method === "POST")
     || (pathname.startsWith("/api/sessions/") && pathname.endsWith("/end") && req.method === "POST")
     || (pathname.startsWith("/api/sessions/") && pathname.endsWith("/attendance") && req.method === "GET");
+}
+
+function isStudentOnly(req: NextRequest) {
+  return req.nextUrl.pathname === "/api/attend" && req.method === "POST";
 }

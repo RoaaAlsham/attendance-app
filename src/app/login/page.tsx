@@ -27,7 +27,8 @@ export default function LoginPage() {
       return;
     }
 
-    router.push("/dashboard");
+    const user = (await res.json()) as { role: "lecturer" | "student" };
+    router.push(user.role === "lecturer" ? "/dashboard" : "/");
     router.refresh();
   }
 

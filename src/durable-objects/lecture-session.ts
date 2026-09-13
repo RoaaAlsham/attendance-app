@@ -5,6 +5,7 @@ const TOKEN_TTL_MS = 10_000;
 interface SessionState {
   token: string;
   tokenExpiresAt: number;
+  previousToken: string | null;
 }
 
 export class LectureSession extends DurableObject {
@@ -54,7 +55,7 @@ export class LectureSession extends DurableObject {
     if (!state) {
       return Response.json({ valid: false, reason: "no active token" });
     }
-    if (Date.now() > state.tokenExpiresAt) {
+    if (body.token === state.previousToken || Date.now() > state.tokenExpiresAt) {
       return Response.json({ valid: false, reason: "expired" });
     }
     if (body.token !== state.token) {
@@ -82,9 +83,11 @@ export class LectureSession extends DurableObject {
   }
 
   private async rotateToken(): Promise<void> {
+    const previous = await this.getState();
     const state: SessionState = {
       token: crypto.randomUUID(),
       tokenExpiresAt: Date.now() + TOKEN_TTL_MS,
+      previousToken: previous?.token ?? null,
     };
     await this.ctx.storage.put("state", state);
     await this.ctx.storage.setAlarm(Date.now() + TOKEN_TTL_MS);
