@@ -28,6 +28,10 @@ function unauthorized(req: NextRequest) {
 }
 
 function isLecturerOnly(req: NextRequest) {
-  return req.nextUrl.pathname.startsWith("/dashboard")
-    || (req.nextUrl.pathname.startsWith("/api/courses") && req.method === "POST");
+  const { pathname } = req.nextUrl;
+  return pathname.startsWith("/dashboard")
+    || (pathname.startsWith("/api/courses") && req.method === "POST")
+    || (pathname === "/api/sessions" && req.method === "POST")
+    || (pathname.startsWith("/api/sessions/") && pathname.endsWith("/end") && req.method === "POST")
+    || (pathname.startsWith("/api/sessions/") && pathname.endsWith("/attendance") && req.method === "GET");
 }

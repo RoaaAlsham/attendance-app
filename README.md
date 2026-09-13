@@ -41,6 +41,7 @@ convention-bound file, so there's no reason to nest it under `src/`.
 - **Durable Objects** — one `LectureSession` DO per lecture session, rotating
   the QR token and driving the live WebSocket feed to the projector/dashboard.
 - **Wrangler** for local dev bindings, migrations, and deployment.
+- **`qrcode`** (client-side) renders the rotating QR on the projector page.
 
 ## Project status
 
@@ -55,7 +56,8 @@ convention-bound file, so there's no reason to nest it under `src/`.
 - ✅ **Phase 4 — Durable Object + custom worker**: `LectureSession` DO
   rotates a QR token every ~10s over a WebSocket, with token validation and
   attendance-notify broadcasting (this phase — see below).
-- ⬜ Phase 5 — Lecturer flow (pages)
+- ✅ **Phase 5 — Lecturer flow (pages)**: login, dashboard (course +
+  session creation), and the live projector page (this phase — see below).
 - ⬜ Phase 6 — Student flow (pages)
 - ⬜ Phase 7 — Anti-fraud checks
 - ⬜ Phase 8 — Testing & deployment
@@ -156,12 +158,12 @@ reaches Next.js routing — see below.
 | POST | `/api/auth/login` | none | ✅ implemented |
 | POST | `/api/auth/logout` | session | ✅ implemented |
 | GET | `/api/me` | session | ✅ implemented |
-| POST | `/api/courses` | lecturer | stub (auth-checked, 501 body) |
-| GET | `/api/courses` | session | stub (auth-checked, 501 body) |
-| POST | `/api/sessions` | lecturer | stub |
-| GET | `/api/sessions/:id` | session | stub (auth-checked, 501 body) |
-| POST | `/api/sessions/:id/end` | lecturer | stub |
-| GET | `/api/sessions/:id/attendance` | lecturer | stub |
+| POST | `/api/courses` | lecturer | ✅ implemented |
+| GET | `/api/courses` | session | ✅ implemented (own courses only — see below) |
+| POST | `/api/sessions` | lecturer | ✅ implemented |
+| GET | `/api/sessions/:id` | session | ✅ implemented |
+| POST | `/api/sessions/:id/end` | lecturer | ✅ implemented |
+| GET | `/api/sessions/:id/attendance` | lecturer | ✅ implemented |
 | POST | `/api/attend` | student | stub |
 
 Bindings (D1, and later KV/DO) are read directly via
@@ -169,12 +171,11 @@ Bindings (D1, and later KV/DO) are read directly via
 wrapper/adapter layer, since vinext exposes bindings natively in both dev
 and production.
 
-"Auth-checked" stubs sit behind `src/middleware.ts`'s matcher, so an
-unauthenticated/wrong-role request never reaches the `501` body — it's
-rejected with `401`/`403` first. `/api/sessions` (POST) and `/api/attend`
-aren't in the matcher yet (their auth requirements are implemented alongside
-their real logic in Phases 4–6), so they currently return `501` regardless
-of auth state.
+Every route above sits behind `src/middleware.ts`'s matcher, so an
+unauthenticated/wrong-role request never reaches the handler body — it's
+rejected with `401`/`403` first. `/api/attend` is the only remaining stub,
+and is the one route not yet in the matcher (its auth requirement lands
+with its real logic in Phase 6).
 
 ## Authentication (Phase 3)
 
@@ -224,9 +225,15 @@ resolving. Re-verified end-to-end after the move (see below).
 The plan's example `middleware.ts` matcher (`/api/courses`, `/api/sessions`,
 `/dashboard`) omits `/api/me`, even though the API contract marks it
 session-protected and Phase 3's acceptance criteria requires it to return
-401 post-logout. Added `/api/me` to the matcher to satisfy that; `/api/sessions`
-(POST) and `/api/attend` stay unmatched until Phases 4–6 give them real
-logic.
+401 post-logout. Added `/api/me` to the matcher to satisfy that.
+
+The plan's example `isLecturerOnly()` also only covers `/dashboard` and
+`POST /api/courses` — too narrow once Phase 5 gave `POST /api/sessions`,
+`POST /api/sessions/:id/end`, and `GET /api/sessions/:id/attendance` real
+logic, since the API contract marks all three lecturer-only too. Extended
+`isLecturerOnly()` to cover them by path-suffix + method (`GET /api/sessions/:id`
+stays open to any authenticated session, matching the contract). `/api/attend`
+stays unmatched until Phase 6 gives it real logic.
 
 **Known non-blocking notice:** the dev server logs `The "middleware" file
 convention is deprecated. Please use "proxy" instead` (Next.js 16 renamed
@@ -239,8 +246,8 @@ name if the project moves to embrace that convention.
 - Signup → login → `GET /api/me` round-trip (as both a lecturer and a
   student), including rejecting a duplicate signup email with `409` and a
   wrong password with `401`.
-- `POST /api/courses` as a student → `403`; as a lecturer → passes auth,
-  reaches the `501` stub.
+- `POST /api/courses` as a student → `403`; as a lecturer → passes auth (at
+  the time, reached the `501` stub — now creates a real course, see Phase 5).
 - `GET /api/me` with no cookie → `401`.
 - **Revocation:** captured a student's raw session cookie value, logged out,
   then replayed a request using that *exact* captured token directly (not
@@ -335,6 +342,99 @@ from server"), not an HTTP 404. Worth knowing if this ever regresses.
   the shipped code.
 - After the `src/` reorganization, re-ran the same checks (`/api/health`,
   404 handling, the WS handshake returning `101`) to confirm nothing broke.
+
+## Lecturer flow (Phase 5)
+
+- **`src/app/api/courses/route.ts`** — `POST` creates a course owned by the
+  caller (`lecturer_id` = `x-user-id`); `GET` lists courses where
+  `lecturer_id` matches the caller. There's no student/course relationship
+  in the schema (attendance is per-session, not per-enrollment), so for a
+  student this naturally returns an empty list rather than needing special
+  casing.
+- **`src/app/api/sessions/route.ts`** (`POST`) — starts a session for a
+  course, but only after confirming the course's `lecturer_id` matches the
+  caller (`404`, not `403`, if it doesn't — avoids confirming *whether* a
+  course id exists to a lecturer who doesn't own it). Accepts optional
+  `roomLat`/`roomLng` (from the dashboard's geolocation capture) and
+  defaults `radiusM` to 50, ready for Phase 7's geofence check.
+- **`src/app/api/sessions/[id]/route.ts`** (`GET`) — session details
+  joined with the course name/code, open to any authenticated session (not
+  lecturer-only), since a student will eventually need this too.
+- **`src/app/api/sessions/[id]/end/route.ts`** (`POST`) — sets `ended_at`,
+  after checking the caller owns the session (`403` if not) and that it
+  isn't already ended (`409` if so, rather than silently no-opping).
+- **`src/app/api/sessions/[id]/attendance/route.ts`** (`GET`) — the scanned
+  roster for a session (joined with `users` for names), same ownership
+  check as `/end`. Used to pre-populate the projector page's attendance
+  list on load/refresh, independent of the live WebSocket feed.
+- **`src/middleware.ts`** — `isLecturerOnly()` extended (see "A note on
+  project layout history" above) so the three lecturer-only routes above
+  are actually rejected with `403` for a non-lecturer, not just whatever
+  each handler happened to do.
+- **`src/app/login/page.tsx`** — a small client-side form
+  (`POST /api/auth/login`, redirect to `/dashboard` on success). Not called
+  out by name in any phase's step list, but the plan's own project
+  structure diagram lists `app/login/page.tsx`, and without it there's no
+  way to reach `/dashboard` through a browser at all — `src/middleware.ts`
+  redirects an unauthenticated request there.
+- **`src/app/dashboard/page.tsx`** — client component. Loads the caller's
+  courses (`GET /api/courses`) into a `<select>`; a "Capture room location"
+  button calls `navigator.geolocation.getCurrentPosition`; submitting starts
+  a session (`POST /api/sessions`) and redirects to
+  `/sessions/:id/projector`. Also includes a compact inline "new course"
+  form (`POST /api/courses`) — the plan has no dedicated course-management
+  page anywhere, so without this the course `<select>` would stay
+  permanently empty for a new lecturer with no way to fill it from the UI.
+- **`src/app/sessions/[id]/projector/page.tsx`** — client component,
+  `useParams()` for the session id. On mount, fetches session details and
+  the existing attendance roster (so a reload doesn't lose state), then
+  opens two WebSockets: `role=projector` re-renders the QR
+  (`qrcode`'s `QRCode.toDataURL()`, encoding
+  `<origin>/attend?session=<id>&token=<token>`) on every `qr` message;
+  `role=lecturer` appends each `attendance` message's `studentName` to the
+  visible list. "End session" calls `POST /api/sessions/:id/end`; both
+  sockets are closed on unmount.
+
+### Verified in an actual browser, not just curl
+
+Per-route ownership/role enforcement was verified with curl first (a
+second lecturer gets `403` trying to end or view attendance for a session
+they don't own; a student gets `403` from all three lecturer-only session
+routes; ending an already-ended session gets `409`). The pages themselves
+needed a real browser — this environment has no display, so
+`npx playwright install chromium` + a small driver script stood in for
+manual click-through testing:
+
+- Logged in as a lecturer, landed on `/dashboard`, confirmed a
+  curl-created course appeared in the `<select>`.
+- Clicked "Capture room location" (with a mocked Playwright geolocation
+  permission) — coordinates appeared next to the button.
+- Clicked "Start session" — redirected to `/sessions/:id/projector`, and a
+  real QR `<img>` rendered (confirming `qrcode` works in the browser
+  bundle, not just in Node).
+- Triggered the Durable Object's `/notify` from outside (a temporary test
+  route, removed after) while the projector page's `role=lecturer` socket
+  was live — "Live Test Student" appeared in the attendance list and the
+  counter incremented, with **no page reload**, confirming the WebSocket
+  wiring actually works end-to-end in a browser, not just via `Monitor`'s
+  raw WebSocket client (Phase 4's verification method).
+- Left the page open for 11 seconds and confirmed the QR `<img>`'s
+  `src` actually changed — the rotation is visible to a real client, not
+  just observable over a raw socket.
+- Checked `console --errors`-equivalent (`page.on("console")` filtered to
+  `error`) after every step: none.
+- One real gotcha hit and worked around: clicking the login button
+  immediately after `page.goto()` submitted a plain HTML form POST instead
+  of running the React `onSubmit` handler, because the page hadn't
+  hydrated yet — vinext/Vite compiles routes on first request, so the
+  first navigation can take several seconds before JS actually attaches.
+  Fixed by waiting for network-idle plus a short buffer before the first
+  interaction; not an app bug, a test-driver timing issue.
+
+Test lecturer/student accounts, the test course, and its sessions were all
+deleted from the local D1 database after verification (in dependency order:
+`attendance` → `sessions` → `courses` → `auth_sessions` → `users`, since
+foreign keys are enforced).
 
 ## Configuration notes
 
