@@ -25,9 +25,9 @@ the full phased implementation plan this project follows.
 - ✅ **Phase 0 — Environment setup**: project scaffolded with vinext,
   Cloudflare Workers as the deploy target, D1 bound (`DB`), `wrangler dev`
   runs cleanly.
-- ✅ **Phase 1 — Data model & D1 schema**: schema migrated locally (this
-  phase — see below).
-- ⬜ Phase 2 — Route handler scaffold
+- ✅ **Phase 1 — Data model & D1 schema**: schema migrated locally.
+- ✅ **Phase 2 — Next.js app scaffold & routing**: every API endpoint exists
+  as a Route Handler (this phase — see below).
 - ⬜ Phase 3 — Authentication
 - ⬜ Phase 4 — Durable Object + custom worker
 - ⬜ Phase 5 — Lecturer flow (pages)
@@ -112,6 +112,41 @@ A duplicate `(session_id, user_id)` insert into `attendance` is rejected with
 `UNIQUE constraint failed` — this has been verified manually and is the
 invariant later phases (the `/api/attend` route) rely on to detect
 "already scanned" instead of racing on application logic.
+
+## API routes
+
+Every endpoint from the plan exists as a Route Handler under `app/api/`.
+Everything except `/api/health` is currently a stub returning
+`501 { "error": "not implemented" }` — real logic lands in Phases 3, 5, 6,
+and 7. There is deliberately no route for the WebSocket channel
+(`/api/sessions/:id/ws`); Phase 4 handles that in a custom worker entry
+(`worker/index.ts`) that intercepts it before the request reaches Next.js
+routing.
+
+| Method | Path | Status |
+|---|---|---|
+| GET | `/api/health` | ✅ implemented — runs `SELECT 1` against `env.DB` as a binding smoke test |
+| POST | `/api/auth/signup` | stub |
+| POST | `/api/auth/login` | stub |
+| POST | `/api/auth/logout` | stub |
+| GET | `/api/me` | stub |
+| POST | `/api/courses` | stub |
+| GET | `/api/courses` | stub |
+| POST | `/api/sessions` | stub |
+| GET | `/api/sessions/:id` | stub |
+| POST | `/api/sessions/:id/end` | stub |
+| GET | `/api/sessions/:id/attendance` | stub |
+| POST | `/api/attend` | stub |
+
+Bindings (D1, and later KV/DO) are read directly via
+`import { env } from "cloudflare:workers"` inside route handlers — no
+wrapper/adapter layer, since vinext exposes bindings natively in both dev
+and production.
+
+Verified manually against `npm run dev`: every route above responds (200 for
+`/api/health`, 501 for the stubs), and requesting an unmapped path (e.g.
+`/api/does-not-exist`) renders Next.js's normal 404 page rather than a
+worker-level error.
 
 ## Configuration notes
 
