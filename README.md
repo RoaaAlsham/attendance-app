@@ -6,8 +6,9 @@ their phone to check in. Built on Next.js (App Router) running on Cloudflare
 Workers via [vinext](https://vinext.dev/), with D1 for storage and a Durable
 Object driving the rotating token / live attendance feed.
 
-See `attendance-app-implementation-plan(1).md` (git-ignored, local only) for
-the full phased implementation plan this project follows.
+See `attendance-app-implementation-plan-v2.md` (git-ignored, local only) for
+the full phased implementation plan this project follows. v2 supersedes the
+original plan, revising Phase 3's session design (see below).
 
 ## Stack
 
@@ -27,8 +28,9 @@ the full phased implementation plan this project follows.
   runs cleanly.
 - ✅ **Phase 1 — Data model & D1 schema**: schema migrated locally.
 - ✅ **Phase 2 — Next.js app scaffold & routing**: every API endpoint exists
-  as a Route Handler (this phase — see below).
-- ⬜ Phase 3 — Authentication
+  as a Route Handler.
+- ✅ **Phase 3 — Authentication**: opaque, DB-backed session tokens with
+  real revocation (this phase — see below).
 - ⬜ Phase 4 — Durable Object + custom worker
 - ⬜ Phase 5 — Lecturer flow (pages)
 - ⬜ Phase 6 — Student flow (pages)
@@ -57,8 +59,9 @@ there's no separate "UI-only" dev mode to worry about.
 
 ## Data model
 
-Defined in [migrations/0001_init.sql](migrations/0001_init.sql) and applied
-with Wrangler's D1 migration tooling.
+Defined in [migrations/0001_init.sql](migrations/0001_init.sql) and
+[migrations/0002_auth_sessions.sql](migrations/0002_auth_sessions.sql),
+applied with Wrangler's D1 migration tooling.
 
 | Table | Purpose |
 |---|---|
@@ -66,6 +69,7 @@ with Wrangler's D1 migration tooling.
 | `courses` | Owned by a lecturer (`lecturer_id`). |
 | `sessions` | One lecture session for a course; optionally carries room coordinates (`room_lat`/`room_lng`) and a check-in radius (`radius_m`) for the Phase 7 geofence check. |
 | `attendance` | One row per student check-in. `UNIQUE(session_id, user_id)` enforces "one scan per student per session" at the database level. |
+| `auth_sessions` | One row per active login (Phase 3). Primary key is a SHA-256 hash of the opaque session token, never the token itself — same reasoning as `password_hash`. Named separately from `sessions` (lecture sessions) to avoid confusion. |
 
 ### Working with migrations
 
@@ -92,9 +96,10 @@ local testing:
 npx wrangler d1 execute attendance --local --file=./scripts/seed.sql
 ```
 
-Their `password_hash` values are placeholders (`'placeholder-hash'`) — real
-password hashing lands in Phase 3, at which point these rows should be
-re-seeded with real hashes (or signed up through the API instead).
+Their `password_hash` values are placeholders (`'placeholder-hash'`), not
+real PBKDF2 hashes — they won't pass `POST /api/auth/login`. Sign up through
+the API instead to get a working test account, or re-seed with a real hash
+produced by `hashPassword()` from [lib/password.ts](lib/password.ts).
 
 | Role | Email | id |
 |---|---|---|
@@ -116,37 +121,111 @@ invariant later phases (the `/api/attend` route) rely on to detect
 ## API routes
 
 Every endpoint from the plan exists as a Route Handler under `app/api/`.
-Everything except `/api/health` is currently a stub returning
-`501 { "error": "not implemented" }` — real logic lands in Phases 3, 5, 6,
-and 7. There is deliberately no route for the WebSocket channel
+There is deliberately no route for the WebSocket channel
 (`/api/sessions/:id/ws`); Phase 4 handles that in a custom worker entry
 (`worker/index.ts`) that intercepts it before the request reaches Next.js
 routing.
 
-| Method | Path | Status |
-|---|---|---|
-| GET | `/api/health` | ✅ implemented — runs `SELECT 1` against `env.DB` as a binding smoke test |
-| POST | `/api/auth/signup` | stub |
-| POST | `/api/auth/login` | stub |
-| POST | `/api/auth/logout` | stub |
-| GET | `/api/me` | stub |
-| POST | `/api/courses` | stub |
-| GET | `/api/courses` | stub |
-| POST | `/api/sessions` | stub |
-| GET | `/api/sessions/:id` | stub |
-| POST | `/api/sessions/:id/end` | stub |
-| GET | `/api/sessions/:id/attendance` | stub |
-| POST | `/api/attend` | stub |
+| Method | Path | Auth | Status |
+|---|---|---|---|
+| GET | `/api/health` | none | ✅ runs `SELECT 1` against `env.DB` as a binding smoke test |
+| POST | `/api/auth/signup` | none | ✅ implemented |
+| POST | `/api/auth/login` | none | ✅ implemented |
+| POST | `/api/auth/logout` | session | ✅ implemented |
+| GET | `/api/me` | session | ✅ implemented |
+| POST | `/api/courses` | lecturer | stub (auth-checked, 501 body) |
+| GET | `/api/courses` | session | stub (auth-checked, 501 body) |
+| POST | `/api/sessions` | lecturer | stub |
+| GET | `/api/sessions/:id` | session | stub (auth-checked, 501 body) |
+| POST | `/api/sessions/:id/end` | lecturer | stub |
+| GET | `/api/sessions/:id/attendance` | lecturer | stub |
+| POST | `/api/attend` | student | stub |
 
 Bindings (D1, and later KV/DO) are read directly via
 `import { env } from "cloudflare:workers"` inside route handlers — no
 wrapper/adapter layer, since vinext exposes bindings natively in both dev
 and production.
 
-Verified manually against `npm run dev`: every route above responds (200 for
-`/api/health`, 501 for the stubs), and requesting an unmapped path (e.g.
-`/api/does-not-exist`) renders Next.js's normal 404 page rather than a
-worker-level error.
+"Auth-checked" stubs sit behind `middleware.ts`'s matcher, so an
+unauthenticated/wrong-role request never reaches the `501` body — it's
+rejected with `401`/`403` first. `/api/sessions` (POST) and `/api/attend`
+aren't in the matcher yet (their auth requirements are implemented alongside
+their real logic in Phases 4–6), so they currently return `501` regardless
+of auth state.
+
+## Authentication (Phase 3)
+
+Sessions are **opaque, DB-backed tokens**, not JWTs — see
+`attendance-app-implementation-plan-v2.md` for the full rationale. In short:
+a JWT is self-verifying and can't be revoked early short of a blocklist; an
+opaque token is a random string that's meaningless without a matching row in
+`auth_sessions`, so logging out deletes that row and the token is dead
+everywhere it exists, immediately — not just in the browser that logged out.
+
+- **`lib/password.ts`** — `hashPassword`/`verifyPassword` using
+  `crypto.subtle` PBKDF2 (100,000 iterations, SHA-256, random 16-byte salt
+  per user). No npm `bcrypt`, since it needs Node natives unavailable in the
+  Workers runtime.
+- **`lib/session.ts`** — `createSession`, `verifySession`, `revokeSession`,
+  `revokeAllSessionsForUser`. Tokens are 32 random bytes (base64url-encoded);
+  only a SHA-256 hash of the token is ever stored, in the `auth_sessions`
+  table added by [migrations/0002_auth_sessions.sql](migrations/0002_auth_sessions.sql).
+  Sessions last 7 days and are checked (and lazily purged if expired) on
+  every use — nothing is embedded in the token itself, so a role change
+  takes effect on the user's very next request.
+- **`middleware.ts`** — looks up the session cookie against D1 on every
+  matched request, then forwards the verified identity to route handlers via
+  `x-user-id`/`x-user-role` request headers (middleware can't hand a JS
+  object to a Route Handler directly).
+- Cookie: `session=<token>; HttpOnly; Secure; SameSite=Lax; Path=/`. Because
+  of `Secure`, the cookie won't be *set* by a real browser talking to the dev
+  server over plain `http://localhost` — this only affects manual browser
+  testing, not curl (which ignores `Secure`) or a deployed (`https://`)
+  instance. Switch to a real browser test once TLS is in place, or drop
+  `Secure` locally if you need to click through the flow in dev before then.
+
+### Deviations from the plan's literal file paths
+
+The plan's project-structure diagram nests library code under `src/lib/` and
+`src/middleware.ts`, but this project's `app/` directory lives at the repo
+root (not `src/app/`), and Next.js requires `middleware.ts` to sit beside
+`app/`, not inside a `src/` that `app/` isn't part of — plus the `@/*`
+tsconfig path alias already resolves to the project root, matching the
+plan's own `@/lib/session` import literally. So `lib/` and `middleware.ts`
+were placed at the repo root instead. Confirmed working: `npm run dev` logs
+that it found and loaded `middleware.ts` (with a "middleware is deprecated,
+use proxy" notice — see below), and the auth behavior it implements was
+verified end-to-end.
+
+The plan's example `middleware.ts` matcher (`/api/courses`, `/api/sessions`,
+`/dashboard`) omits `/api/me`, even though the API contract marks it
+session-protected and Phase 3's acceptance criteria requires it to return
+401 post-logout. Added `/api/me` to the matcher to satisfy that; `/api/sessions`
+(POST) and `/api/attend` stay unmatched until Phases 4–6 give them real
+logic.
+
+**Known non-blocking notice:** the dev server logs `The "middleware" file
+convention is deprecated. Please use "proxy" instead` (Next.js 16 renamed
+`middleware.ts` → `proxy.ts`, same export shape). Functionality is
+unaffected; a future cleanup could rename the file and adjust the export
+name if the project moves to embrace that convention.
+
+### Verified manually against `npm run dev`
+
+- Signup → login → `GET /api/me` round-trip (as both a lecturer and a
+  student), including rejecting a duplicate signup email with `409` and a
+  wrong password with `401`.
+- `POST /api/courses` as a student → `403`; as a lecturer → passes auth,
+  reaches the `501` stub.
+- `GET /api/me` with no cookie → `401`.
+- **Revocation:** captured a student's raw session cookie value, logged out,
+  then replayed a request using that *exact* captured token directly (not
+  just "the browser cookie is gone") — got `401`. Confirmed the row was
+  actually deleted from `auth_sessions` (JWTs can't do this: the token stays
+  valid until it expires, no matter what the server does).
+- Manually back-dated an `auth_sessions.expires_at` to the past — the next
+  request with that cookie got `401`, and the row was purged from the table
+  as a side effect of that lookup (lazy cleanup, as designed).
 
 ## Configuration notes
 

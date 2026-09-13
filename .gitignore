@@ -6,3 +6,4 @@ next-env.d.ts
 .vinext/
 .wrangler/
 attendance-app-implementation-plan*.md
+attendance-app-implementation-plan-v2.md
